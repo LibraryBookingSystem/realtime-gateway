@@ -1,0 +1,16 @@
+{
+  "name": "realtime-gateway",
+  "version": "1.0.0",
+  "description": "WebSocket gateway for real-time updates in library booking system",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "ws": "^8.14.2",
+    "amqplib": "^0.10.3"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
