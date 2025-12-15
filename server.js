@@ -20,44 +20,85 @@ async function connectRabbitMQ() {
     
     console.log('Connected to RabbitMQ');
     
-    // Set up exchange for real-time updates
-    const exchange = 'library.realtime';
-    await rabbitmqChannel.assertExchange(exchange, 'topic', { durable: false });
+    // Set up exchanges
+    await rabbitmqChannel.assertExchange('booking.events', 'topic', { durable: true });
+    await rabbitmqChannel.assertExchange('resource.events', 'topic', { durable: true });
     
-    // Listen for booking events
+    // Listen for booking events (from booking.events exchange)
     const bookingQueue = 'realtime.booking';
     await rabbitmqChannel.assertQueue(bookingQueue, { durable: false });
-    await rabbitmqChannel.bindQueue(bookingQueue, exchange, 'booking.*');
+    await rabbitmqChannel.bindQueue(bookingQueue, 'booking.events', 'booking.created');
+    await rabbitmqChannel.bindQueue(bookingQueue, 'booking.events', 'booking.updated');
+    await rabbitmqChannel.bindQueue(bookingQueue, 'booking.events', 'booking.canceled');
+    await rabbitmqChannel.bindQueue(bookingQueue, 'booking.events', 'booking.checked_in');
     
-    // Listen for resource availability events
+    // Listen for resource events (from resource.events exchange)
     const resourceQueue = 'realtime.resource';
     await rabbitmqChannel.assertQueue(resourceQueue, { durable: false });
-    await rabbitmqChannel.bindQueue(resourceQueue, exchange, 'resource.*');
+    await rabbitmqChannel.bindQueue(resourceQueue, 'resource.events', 'resource.created');
+    await rabbitmqChannel.bindQueue(resourceQueue, 'resource.events', 'resource.updated');
+    await rabbitmqChannel.bindQueue(resourceQueue, 'resource.events', 'resource.deleted');
     
-    // Consume messages and broadcast to WebSocket clients
+    // Consume booking messages and broadcast to WebSocket clients
     rabbitmqChannel.consume(bookingQueue, (msg) => {
       if (msg) {
-        const content = JSON.parse(msg.content.toString());
-        broadcastToClients({
-          type: 'availability_update',
-          resourceId: content.resourceId,
-          status: content.status,
-          ...content
-        });
-        rabbitmqChannel.ack(msg);
+        try {
+          const content = JSON.parse(msg.content.toString());
+          // Extract resourceId from booking and determine availability
+          const resourceId = content.resourceId;
+          let status = 'available';
+          
+          // Determine status based on booking status
+          if (content.status === 'CONFIRMED' || content.status === 'CHECKED_IN') {
+            status = 'unavailable';
+          } else if (content.status === 'CANCELED' || content.status === 'NO_SHOW') {
+            status = 'available';
+          }
+          
+          // Ensure resourceId is a number
+          const resourceIdNum = typeof resourceId === 'string' ? parseInt(resourceId, 10) : resourceId;
+          
+          console.log(`Broadcasting availability update: resourceId=${resourceIdNum}, status=${status}, event=${msg.fields.routingKey}`);
+          
+          broadcastToClients({
+            type: 'availability_update',
+            resourceId: resourceIdNum,
+            status: status,
+            bookingId: content.id,
+            event: msg.fields.routingKey
+          });
+          rabbitmqChannel.ack(msg);
+        } catch (error) {
+          console.error('Error processing booking message:', error);
+          rabbitmqChannel.nack(msg, false, false);
+        }
       }
     });
     
+    // Consume resource messages and broadcast to WebSocket clients
     rabbitmqChannel.consume(resourceQueue, (msg) => {
       if (msg) {
-        const content = JSON.parse(msg.content.toString());
-        broadcastToClients({
-          type: 'availability_update',
-          resourceId: content.resourceId,
-          status: content.status,
-          ...content
-        });
-        rabbitmqChannel.ack(msg);
+        try {
+          const content = JSON.parse(msg.content.toString());
+          const resourceId = content.id || content;
+          let status = content.status ? content.status.toLowerCase() : 'available';
+          
+          // Handle deleted resources
+          if (typeof content === 'number' || msg.fields.routingKey === 'resource.deleted') {
+            status = 'deleted';
+          }
+          
+          broadcastToClients({
+            type: 'availability_update',
+            resourceId: resourceId,
+            status: status,
+            event: msg.fields.routingKey
+          });
+          rabbitmqChannel.ack(msg);
+        } catch (error) {
+          console.error('Error processing resource message:', error);
+          rabbitmqChannel.nack(msg, false, false);
+        }
       }
     });
     
@@ -71,16 +112,23 @@ async function connectRabbitMQ() {
 // Broadcast message to all connected WebSocket clients
 function broadcastToClients(data) {
   const message = JSON.stringify(data);
+  let sentCount = 0;
   wss.clients.forEach((client) => {
     if (client.readyState === WebSocket.OPEN) {
-      client.send(message);
+      try {
+        client.send(message);
+        sentCount++;
+      } catch (error) {
+        console.error('Error sending message to client:', error);
+      }
     }
   });
+  console.log(`Broadcasted to ${sentCount} client(s): ${message}`);
 }
 
 // Handle WebSocket connections
 wss.on('connection', (ws, req) => {
-  console.log('New WebSocket client connected');
+  console.log(`New WebSocket client connected from ${req.socket.remoteAddress}`);
   
   // Send welcome message
   ws.send(JSON.stringify({
@@ -88,17 +136,20 @@ wss.on('connection', (ws, req) => {
     message: 'Connected to realtime gateway'
   }));
   
+  console.log('Sent welcome message to client');
+  
   // Handle incoming messages from client
   ws.on('message', (message) => {
     try {
       const data = JSON.parse(message.toString());
       
-      // Handle subscription requests
-      if (data.type === 'subscribe' && data.topic) {
-        console.log(`Client subscribed to: ${data.topic}`);
+      // Handle subscription requests (support both 'topic' and 'event' fields)
+      if (data.type === 'subscribe' && (data.topic || data.event)) {
+        const topic = data.topic || data.event;
+        console.log(`Client subscribed to: ${topic}`);
         ws.send(JSON.stringify({
           type: 'subscribed',
-          topic: data.topic
+          topic: topic
         }));
       }
     } catch (error) {
