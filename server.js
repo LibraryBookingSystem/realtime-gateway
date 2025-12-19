@@ -71,6 +71,25 @@ async function connectRabbitMQ() {
       "resource.deleted"
     );
 
+    // Listen for policy events (from policy.events exchange)
+    const policyQueue = "realtime.policy";
+    await rabbitmqChannel.assertQueue(policyQueue, { durable: false });
+    await rabbitmqChannel.bindQueue(
+      policyQueue,
+      "policy.events",
+      "policy.created"
+    );
+    await rabbitmqChannel.bindQueue(
+      policyQueue,
+      "policy.events",
+      "policy.updated"
+    );
+    await rabbitmqChannel.bindQueue(
+      policyQueue,
+      "policy.events",
+      "policy.deleted"
+    );
+
     // Consume booking messages and broadcast to WebSocket clients
     rabbitmqChannel.consume(bookingQueue, (msg) => {
       if (msg) {
@@ -143,19 +162,70 @@ async function connectRabbitMQ() {
               status: status,
               event: routingKey,
             });
-          } else if (
-            routingKey === "resource.created" ||
-            routingKey === "resource.deleted"
-          ) {
-            // For resource creation/deletion, just log - users should use refresh button
+          } else if (routingKey === "resource.created") {
+            // Broadcast resource creation to all clients
             console.log(
-              `Resource ${routingKey} event received - users should refresh to see changes`
+              `Broadcasting resource.created event: id=${content.id}, name=${content.name}`
             );
+            broadcastToClients({
+              type: "resource_created",
+              resource: content,
+              event: routingKey,
+            });
+          } else if (routingKey === "resource.deleted") {
+            // Broadcast resource deletion to all clients
+            const resourceId = typeof content === "object" ? content.id : content;
+            console.log(`Broadcasting resource.deleted event: id=${resourceId}`);
+            broadcastToClients({
+              type: "resource_deleted",
+              resourceId: resourceId,
+              event: routingKey,
+            });
           }
 
           rabbitmqChannel.ack(msg);
         } catch (error) {
           console.error("Error processing resource message:", error);
+          rabbitmqChannel.nack(msg, false, false);
+        }
+      }
+    });
+
+    // Consume policy messages and broadcast to WebSocket clients
+    rabbitmqChannel.consume(policyQueue, (msg) => {
+      if (msg) {
+        try {
+          const content = JSON.parse(msg.content.toString());
+          const routingKey = msg.fields.routingKey;
+
+          console.log(
+            `Broadcasting policy event: ${routingKey}, id=${content.id || content}`
+          );
+
+          if (routingKey === "policy.created") {
+            broadcastToClients({
+              type: "policy_created",
+              policy: content,
+              event: routingKey,
+            });
+          } else if (routingKey === "policy.updated") {
+            broadcastToClients({
+              type: "policy_updated",
+              policy: content,
+              event: routingKey,
+            });
+          } else if (routingKey === "policy.deleted") {
+            const policyId = typeof content === "object" ? content.id : content;
+            broadcastToClients({
+              type: "policy_deleted",
+              policyId: policyId,
+              event: routingKey,
+            });
+          }
+
+          rabbitmqChannel.ack(msg);
+        } catch (error) {
+          console.error("Error processing policy message:", error);
           rabbitmqChannel.nack(msg, false, false);
         }
       }
