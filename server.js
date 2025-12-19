@@ -27,6 +27,9 @@ async function connectRabbitMQ() {
     await rabbitmqChannel.assertExchange("resource.events", "topic", {
       durable: true,
     });
+    await rabbitmqChannel.assertExchange("policy.events", "topic", {
+      durable: true,
+    });
 
     // Listen for booking events (from booking.events exchange)
     const bookingQueue = "realtime.booking";
@@ -95,40 +98,85 @@ async function connectRabbitMQ() {
       if (msg) {
         try {
           const content = JSON.parse(msg.content.toString());
-          // Extract resourceId from booking and determine availability
-          const resourceId = content.resourceId;
-          let status = "available";
+          const routingKey = msg.fields.routingKey || "";
 
-          // Determine status based on booking status
+          // Determine event type based on routing key or content
+          let eventType = "availability_update";
           if (
-            content.status === "CONFIRMED" ||
-            content.status === "CHECKED_IN"
+            routingKey.includes("booking.created") ||
+            content.eventType === "booking.created"
           ) {
-            status = "unavailable";
+            eventType = "booking_created";
           } else if (
-            content.status === "CANCELED" ||
-            content.status === "NO_SHOW"
+            routingKey.includes("booking.canceled") ||
+            routingKey.includes("booking.cancelled") ||
+            content.eventType === "booking.canceled" ||
+            content.eventType === "booking.cancelled"
           ) {
-            status = "available";
+            eventType = "booking_cancelled";
+          } else if (
+            routingKey.includes("booking.updated") ||
+            content.eventType === "booking.updated"
+          ) {
+            eventType = "booking_updated";
           }
 
-          // Ensure resourceId is a number
-          const resourceIdNum =
-            typeof resourceId === "string"
-              ? parseInt(resourceId, 10)
-              : resourceId;
+          // Extract fields from booking content
+          const bookingId = content.id || content.bookingId;
+          const userId = content.userId;
+          const resourceId = content.resourceId;
+          const bookingStatus = content.status;
 
-          console.log(
-            `Broadcasting availability update: resourceId=${resourceIdNum}, status=${status}, event=${msg.fields.routingKey}`
-          );
-
+          // Broadcast booking event (for realtime provider to handle)
           broadcastToClients({
-            type: "availability_update",
-            resourceId: resourceIdNum,
-            status: status,
-            bookingId: content.id,
-            event: msg.fields.routingKey,
+            type: eventType,
+            bookingId: bookingId,
+            userId: userId,
+            resourceId: resourceId,
+            status: bookingStatus,
+            data: content,
+            event: routingKey,
           });
+
+          // Also broadcast availability update for resource status changes
+          if (resourceId) {
+            // Ensure resourceId is a number
+            const resourceIdNum =
+              typeof resourceId === "string"
+                ? parseInt(resourceId, 10)
+                : resourceId;
+
+            // Determine availability status based on booking status or event type
+            let status = "available";
+            if (
+              eventType === "booking_created" ||
+              eventType === "booking_updated" ||
+              bookingStatus === "CONFIRMED" ||
+              bookingStatus === "CHECKED_IN"
+            ) {
+              status = "unavailable";
+            } else if (
+              eventType === "booking_cancelled" ||
+              bookingStatus === "CANCELED" ||
+              bookingStatus === "NO_SHOW"
+            ) {
+              status = "available";
+            }
+
+            console.log(
+              `Broadcasting availability update: resourceId=${resourceIdNum}, status=${status}, event=${routingKey}`
+            );
+
+            broadcastToClients({
+              type: "availability_update",
+              resourceId: resourceIdNum,
+              status: status,
+              bookingId: bookingId,
+              event: routingKey,
+              timestamp: content.timestamp || new Date().toISOString(),
+            });
+          }
+
           rabbitmqChannel.ack(msg);
         } catch (error) {
           console.error("Error processing booking message:", error);
