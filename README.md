@@ -1,5 +1,7 @@
 # Realtime Gateway
 
+Part of the [Library Booking System](https://github.com/LibraryBookingSystem/Documentation).
+
 WebSocket gateway service for real-time updates in the library booking system.
 
 ## Overview
